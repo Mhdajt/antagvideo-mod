@@ -1,0 +1,583 @@
+name: Build and Release Antag Video Mod
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract clean source assets
+        run: |
+          mkdir -p project
+          unzip -q antagvideo_clean_source.zip -d project
+          # Move clean_video_mod contents into project root if nested
+          if [ -d project/clean_video_mod ]; then
+            cp -r project/clean_video_mod/* project/
+            rm -rf project/clean_video_mod
+          fi
+
+      - name: Apply Fabric 26.2 Toolchain & Code
+        working-directory: project
+        run: |
+          cat << 'BUILD_GRADLE' > build.gradle
+          plugins {
+              id 'net.fabricmc.fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+              it.options.encoding = "UTF-8"
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          BUILD_GRADLE
+
+          cat << 'PROPS' > gradle.properties
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          org.gradle.configuration-cache=false
+
+          minecraft_version=26.2
+          loader_version=0.19.3
+          loom_version=1.17-SNAPSHOT
+
+          mod_version=1.1.0
+          maven_group=com.antagvideo
+          archives_base_name=antagvideo
+
+          fabric_api_version=0.150.1+26.2
+          PROPS
+
+          cat << 'SETTINGS' > settings.gradle
+          pluginManagement {
+              repositories {
+                  maven { url = "https://maven.fabricmc.net/" }
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'antagvideo'
+          SETTINGS
+
+          cat << 'MOD_JSON' > src/main/resources/fabric.mod.json
+          {
+            "schemaVersion": 1,
+            "id": "antagvideo",
+            "version": "${version}",
+            "name": "Antag Video",
+            "description": "Fullscreen video cutscene player for Fabric 26.2. Command: /videoplay <video> <player>",
+            "authors": [
+              "Mhdajt"
+            ],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": [
+                "com.antagvideo.AntagVideoMod"
+              ],
+              "client": [
+                "com.antagvideo.client.AntagVideoClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.1",
+              "minecraft": ">=26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          MOD_JSON
+
+          # Also write sounds.json to map intro sound
+          cat << 'SOUNDS_JSON' > src/main/resources/assets/antagvideo/sounds.json
+          {
+            "intro": {
+              "category": "master",
+              "sounds": [
+                {
+                  "name": "antagvideo:intro",
+                  "stream": true
+                }
+              ]
+            }
+          }
+          SOUNDS_JSON
+
+          # Write 26.2 Java implementation
+          mkdir -p src/main/java/com/antagvideo/client
+
+          cat << 'PAYLOAD' > src/main/java/com/antagvideo/PlayVideoPayload.java
+          package com.antagvideo;
+
+          import net.minecraft.network.FriendlyByteBuf;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+          import net.minecraft.resources.Identifier;
+
+          public record PlayVideoPayload(String name) implements CustomPacketPayload {
+              public static final Type<PlayVideoPayload> TYPE =
+                  new Type<>(Identifier.fromNamespaceAndPath("antagvideo", "play_video"));
+
+              public static final StreamCodec<FriendlyByteBuf, PlayVideoPayload> CODEC =
+                  StreamCodec.of(
+                      (buf, payload) -> buf.writeUtf(payload.name()),
+                      buf -> new PlayVideoPayload(buf.readUtf())
+                  );
+
+              @Override
+              public Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          PAYLOAD
+
+          cat << 'MOD_JAVA' > src/main/java/com/antagvideo/AntagVideoMod.java
+          package com.antagvideo;
+
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.commands.arguments.EntityArgument;
+          import net.minecraft.server.level.ServerPlayer;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.util.Collection;
+          import java.util.List;
+
+          public class AntagVideoMod implements ModInitializer {
+              public static final String MOD_ID = "antagvideo";
+              public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+
+              @Override
+              public void onInitialize() {
+                  LOGGER.info("Antag Video mod loaded - use /videoplay <video> <player>");
+
+                  PayloadTypeRegistry.clientboundPlay().register(PlayVideoPayload.TYPE, PlayVideoPayload.CODEC);
+
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+                      dispatcher.register(Commands.literal("videoplay")
+                          .then(Commands.argument("video", StringArgumentType.word())
+                              .then(Commands.argument("player", EntityArgument.players())
+                                  .executes(ctx -> send(
+                                      EntityArgument.getPlayers(ctx, "player"),
+                                      StringArgumentType.getString(ctx, "video"))))
+                              .executes(ctx -> {
+                                  ServerPlayer self = ctx.getSource().getPlayerOrException();
+                                  return send(List.of(self), StringArgumentType.getString(ctx, "video"));
+                              })));
+
+                      dispatcher.register(Commands.literal("videostop")
+                          .executes(ctx -> {
+                              ServerPlayer self = ctx.getSource().getPlayerOrException();
+                              return send(List.of(self), "stop");
+                          })
+                          .then(Commands.argument("player", EntityArgument.players())
+                              .executes(ctx -> send(
+                                  EntityArgument.getPlayers(ctx, "player"),
+                                  "stop"))));
+                  });
+              }
+
+              private static int send(Collection<ServerPlayer> players, String video) {
+                  PlayVideoPayload payload = new PlayVideoPayload(video);
+                  for (ServerPlayer player : players) {
+                      ServerPlayNetworking.send(player, payload);
+                  }
+                  return players.size();
+              }
+          }
+          MOD_JAVA
+
+          cat << 'PLAYER_JAVA' > src/main/java/com/antagvideo/client/VideoPlayer.java
+          package com.antagvideo.client;
+
+          import com.antagvideo.AntagVideoMod;
+          import com.mojang.blaze3d.platform.NativeImage;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.renderer.texture.DynamicTexture;
+          import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.sounds.SoundEvent;
+
+          import java.io.InputStream;
+          import java.util.concurrent.ArrayBlockingQueue;
+          import java.util.concurrent.TimeUnit;
+
+          public final class VideoPlayer {
+              public static final Identifier TEXTURE = Identifier.fromNamespaceAndPath(AntagVideoMod.MOD_ID, "video_frame");
+              public static volatile String mode = "fit";
+
+              public static final int TOTAL_FRAMES = 402;
+              public static final double FPS = 9.5;
+              public static final double DURATION = 42.84;
+
+              private record Frame(int index, NativeImage image) {}
+
+              private static volatile boolean running;
+              private static volatile boolean decoderDone;
+              private static volatile long startNanos;
+              private static ArrayBlockingQueue<Frame> queue;
+              private static Thread thread;
+              private static SimpleSoundInstance sound;
+              private static DynamicTexture texture;
+              private static int texW = 854;
+              private static int texH = 392;
+
+              private VideoPlayer() {}
+
+              public static synchronized String start(String name) {
+                  stop();
+
+                  try {
+                      Identifier soundId = Identifier.fromNamespaceAndPath(AntagVideoMod.MOD_ID, name.toLowerCase());
+                      SoundEvent event = SoundEvent.createVariableRangeEvent(soundId);
+                      sound = SimpleSoundInstance.forUI(event, 1.0f);
+                      Minecraft.getInstance().getSoundManager().play(sound);
+                  } catch (Exception e) {
+                      AntagVideoMod.LOGGER.warn("Audio playback note: {}", e.getMessage());
+                  }
+
+                  queue = new ArrayBlockingQueue<>(16);
+                  running = true;
+                  decoderDone = false;
+                  startNanos = System.nanoTime();
+
+                  thread = new Thread(() -> decodeLoop(name), "AntagVideo-Decoder");
+                  thread.setDaemon(true);
+                  thread.start();
+
+                  return null;
+              }
+
+              private static void decodeLoop(String name) {
+                  try {
+                      // Check for FGV container first if bundled
+                      try (InputStream fgvIn = VideoPlayer.class.getResourceAsStream("/assets/antagvideo/" + name + ".fgv")) {
+                          if (fgvIn != null) {
+                              decodeFgv(fgvIn);
+                              return;
+                          }
+                      } catch (Exception ignored) {}
+
+                      // Read sequential JPEG frames from textures/frames/%04d.jpg
+                      for (int i = 1; i <= TOTAL_FRAMES && running; i++) {
+                          String path = String.format("/assets/antagvideo/textures/frames/%04d.jpg", i);
+                          try (InputStream is = VideoPlayer.class.getResourceAsStream(path)) {
+                              if (is != null) {
+                                  NativeImage img = NativeImage.read(is);
+                                  while (running && !queue.offer(new Frame(i, img), 50, TimeUnit.MILLISECONDS)) {
+                                  }
+                              }
+                          }
+                      }
+                  } catch (Exception e) {
+                      AntagVideoMod.LOGGER.error("Decoder error: {}", e.getMessage());
+                  } finally {
+                      decoderDone = true;
+                  }
+              }
+
+              private static void decodeFgv(InputStream in) throws Exception {
+                  java.io.DataInputStream dis = new java.io.DataInputStream(new java.io.BufferedInputStream(in));
+                  byte[] magic = new byte[4];
+                  dis.readFully(magic);
+                  int fgvFps = dis.readInt();
+                  int total = dis.readInt();
+                  for (int i = 0; i < total && running; i++) {
+                      int len = dis.readInt();
+                      byte[] jpeg = new byte[len];
+                      dis.readFully(jpeg);
+                      NativeImage img = NativeImage.read(new java.io.ByteArrayInputStream(jpeg));
+                      while (running && !queue.offer(new Frame(i, img), 50, TimeUnit.MILLISECONDS)) {
+                      }
+                  }
+              }
+
+              public static void pullFrame() {
+                  if (!running) return;
+                  long elapsedNanos = System.nanoTime() - startNanos;
+                  double elapsedSec = elapsedNanos / 1_000_000_000.0;
+                  int targetFrame = (int) (elapsedSec * FPS) + 1;
+
+                  Frame candidate = null;
+                  while (queue != null && !queue.isEmpty()) {
+                      Frame peek = queue.peek();
+                      if (peek != null && peek.index <= targetFrame) {
+                          if (candidate != null) candidate.image.close();
+                          candidate = queue.poll();
+                      } else {
+                          break;
+                      }
+                  }
+
+                  if (candidate != null) {
+                      NativeImage img = candidate.image;
+                      texW = img.getWidth();
+                      texH = img.getHeight();
+
+                      Minecraft mc = Minecraft.getInstance();
+                      if (texture == null) {
+                          texture = new DynamicTexture(texW, texH, false);
+                          mc.getTextureManager().register(TEXTURE, texture);
+                      }
+                      texture.setPixels(img);
+                      texture.upload();
+                      img.close();
+                  }
+              }
+
+              public static synchronized void stop() {
+                  running = false;
+                  if (thread != null) {
+                      thread.interrupt();
+                      thread = null;
+                  }
+                  if (queue != null) {
+                      for (Frame f : queue) {
+                          try { f.image.close(); } catch (Exception ignored) {}
+                      }
+                      queue.clear();
+                      queue = null;
+                  }
+                  if (sound != null) {
+                      try { Minecraft.getInstance().getSoundManager().stop(sound); } catch (Exception ignored) {}
+                      sound = null;
+                  }
+                  if (texture != null) {
+                      try {
+                          Minecraft.getInstance().getTextureManager().release(TEXTURE);
+                          texture.close();
+                      } catch (Exception ignored) {}
+                      texture = null;
+                  }
+              }
+
+              public static boolean isFinished() {
+                  return decoderDone && (queue == null || queue.isEmpty());
+              }
+
+              public static boolean hasTexture() { return texture != null; }
+              public static int texWidth() { return texW > 0 ? texW : 854; }
+              public static int texHeight() { return texH > 0 ? texH : 392; }
+          }
+          PLAYER_JAVA
+
+          cat << 'SCREEN_JAVA' > src/main/java/com/antagvideo/client/VideoPlayerScreen.java
+          package com.antagvideo.client;
+
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.renderer.RenderPipelines;
+          import net.minecraft.network.chat.Component;
+
+          public class VideoPlayerScreen extends Screen {
+              public VideoPlayerScreen() {
+                  super(Component.literal("Antag Video"));
+              }
+
+              @Override
+              public boolean isPauseScreen() {
+                  return false;
+              }
+
+              @Override
+              public boolean shouldCloseOnEsc() {
+                  return true;
+              }
+
+              @Override
+              public void removed() {
+                  VideoPlayer.stop();
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
+                  VideoPlayer.pullFrame();
+                  g.fill(0, 0, this.width, this.height, 0xFF000000);
+
+                  if (VideoPlayer.hasTexture()) {
+                      int tw = VideoPlayer.texWidth();
+                      int th = VideoPlayer.texHeight();
+                      String mode = VideoPlayer.mode;
+
+                      if ("fit".equals(mode)) {
+                          double s = Math.min((double) this.width / tw, (double) this.height / th);
+                          int dw = (int) (tw * s);
+                          int dh = (int) (th * s);
+                          g.blit(RenderPipelines.GUI_TEXTURED, VideoPlayer.TEXTURE,
+                              (this.width - dw) / 2, (this.height - dh) / 2, 0, 0, dw, dh, tw, th, tw, th);
+                      } else if ("cover".equals(mode)) {
+                          double s = Math.max((double) this.width / tw, (double) this.height / th);
+                          int rw = Math.min(tw, (int) Math.ceil(this.width / s));
+                          int rh = Math.min(th, (int) Math.ceil(this.height / s));
+                          g.blit(RenderPipelines.GUI_TEXTURED, VideoPlayer.TEXTURE,
+                              0, 0, (tw - rw) / 2, (th - rh) / 2, this.width, this.height, rw, rh, tw, th);
+                      } else {
+                          g.blit(RenderPipelines.GUI_TEXTURED, VideoPlayer.TEXTURE,
+                              0, 0, 0, 0, this.width, this.height, tw, th, tw, th);
+                      }
+                  }
+
+                  if (VideoPlayer.isFinished()) {
+                      this.onClose();
+                  }
+              }
+          }
+          SCREEN_JAVA
+
+          cat << 'CLIENT_JAVA' > src/main/java/com/antagvideo/client/AntagVideoClient.java
+          package com.antagvideo.client;
+
+          import com.antagvideo.PlayVideoPayload;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.network.chat.Component;
+
+          public class AntagVideoClient implements ClientModInitializer {
+              private static volatile String pendingName;
+
+              @Override
+              public void onInitializeClient() {
+                  ClientPlayNetworking.registerGlobalReceiver(PlayVideoPayload.TYPE, (payload, context) -> {
+                      pendingName = payload.name();
+                  });
+
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) -> {
+                      dispatcher.register(ClientCommands.literal("antagmode")
+                          .then(ClientCommands.literal("stretch").executes(ctx -> {
+                              VideoPlayer.mode = "stretch";
+                              return 1;
+                          }))
+                          .then(ClientCommands.literal("cover").executes(ctx -> {
+                              VideoPlayer.mode = "cover";
+                              return 1;
+                          }))
+                          .then(ClientCommands.literal("fit").executes(ctx -> {
+                              VideoPlayer.mode = "fit";
+                              return 1;
+                          })));
+                  });
+
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      String name = pendingName;
+                      if (name == null || mc.gui.screen() != null) {
+                          return;
+                      }
+                      pendingName = null;
+
+                      if ("stop".equals(name)) {
+                          VideoPlayer.stop();
+                          return;
+                      }
+                      String error = VideoPlayer.start(name);
+                      if (error != null) {
+                          if (mc.player != null) {
+                              mc.player.sendSystemMessage(Component.literal("[Antag Video] " + error));
+                          }
+                      } else {
+                          mc.setScreenAndShow(new VideoPlayerScreen());
+                      }
+                  });
+              }
+          }
+          CLIENT_JAVA
+
+          # Remove old VideoCommand / VideoRenderer if present
+          rm -f src/main/java/com/antagvideo/command/VideoCommand.java
+          rm -f src/main/java/com/antagvideo/client/VideoRenderer.java
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+
+      - name: Build with Gradle
+        working-directory: project
+        run: gradle build --no-daemon --stacktrace
+
+      - name: Upload the mod jar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: antagvideo-1.1.0-jar
+          path: project/build/libs/*.jar
+
+      - name: Publish Ready-to-Install JAR to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          JAR_FILE=$(ls project/build/libs/antagvideo-[0-9]*.jar | grep -v sources | head -n 1)
+          echo "Found compiled mod jar: $JAR_FILE"
+          
+          gh release delete v1.1.0 --yes || true
+          git tag -d v1.1.0 || true
+          git push origin :refs/tags/v1.1.0 || true
+
+          cat << 'NOTES' > /tmp/release_notes.md
+          ### Antag Video Cutscene Player v1.1.0 for Fabric 26.2
+
+          Ready-to-install Minecraft mod built directly from the clean source!
+
+          #### Included Features:
+          - Full 43-second video playback with all 402 high-resolution frames
+          - Synchronized audio playback (`intro.ogg`)
+          - Background-threaded decoding for perfectly smooth 60 FPS rendering without lag spikes
+          - Pure black letterboxing maintaining the exact cinematic aspect ratio (`fit` mode)
+          - Skip at any time by pressing **[ESC]**
+          - Optional aspect ratio command: `/antagmode fit|stretch|cover`
+
+          #### Installation:
+          1. Install **Fabric Loader (0.19+)** and **Fabric API** for Minecraft **26.2**.
+          2. Download **`antagvideo-1.1.0.jar`** below and place it into your `.minecraft/mods` folder.
+          3. Launch Minecraft!
+
+          #### In-game Commands:
+          - `/videoplay <video name> <player>` (e.g. `/videoplay Intro Steve` or `/videoplay Intro @s`)
+          - `/videostop [player]`
+          NOTES
+
+          gh release create v1.1.0 "$JAR_FILE"             --title "Antag Video Mod v1.1.0 (Fabric 26.2)"             --notes-file /tmp/release_notes.md
