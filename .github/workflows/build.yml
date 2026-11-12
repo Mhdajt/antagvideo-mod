@@ -301,7 +301,7 @@ jobs:
                           String path = String.format("/assets/antagvideo/textures/frames/%04d.jpg", i);
                           try (InputStream is = VideoPlayer.class.getResourceAsStream(path)) {
                               if (is != null) {
-                                  NativeImage img = NativeImage.read(is);
+                                  NativeImage img = NativeImage.read(NativeImage.Format.RGBA, is);
                                   while (running && !queue.offer(new Frame(i, img), 50, TimeUnit.MILLISECONDS)) {
                                   }
                               }
@@ -324,7 +324,7 @@ jobs:
                       int len = dis.readInt();
                       byte[] jpeg = new byte[len];
                       dis.readFully(jpeg);
-                      NativeImage img = NativeImage.read(new java.io.ByteArrayInputStream(jpeg));
+                      NativeImage img = NativeImage.read(NativeImage.Format.RGBA, new java.io.ByteArrayInputStream(jpeg));
                       while (running && !queue.offer(new Frame(i, img), 50, TimeUnit.MILLISECONDS)) {
                       }
                   }
@@ -349,17 +349,18 @@ jobs:
 
                   if (candidate != null) {
                       NativeImage img = candidate.image;
-                      texW = img.getWidth();
-                      texH = img.getHeight();
-
-                      Minecraft mc = Minecraft.getInstance();
-                      if (texture == null) {
-                          texture = new DynamicTexture(texW, texH, false);
-                          mc.getTextureManager().register(TEXTURE, texture);
+                      try {
+                          if (texture == null || texW != img.getWidth() || texH != img.getHeight()) {
+                              texW = img.getWidth();
+                              texH = img.getHeight();
+                              texture = new DynamicTexture(() -> "antagvideo video", texW, texH, false);
+                              Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
+                          }
+                          texture.getPixels().copyFrom(img);
+                          texture.upload();
+                      } finally {
+                          img.close();
                       }
-                      texture.setPixels(img);
-                      texture.upload();
-                      img.close();
                   }
               }
 
@@ -580,4 +581,6 @@ jobs:
           - `/videostop [player]`
           NOTES
 
-          gh release create v1.1.0 "$JAR_FILE"             --title "Antag Video Mod v1.1.0 (Fabric 26.2)"             --notes-file /tmp/release_notes.md
+          gh release create v1.1.0 "$JAR_FILE" \
+            --title "Antag Video Mod v1.1.0 (Fabric 26.2)" \
+            --notes-file /tmp/release_notes.md
