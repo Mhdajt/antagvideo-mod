@@ -1,4 +1,4 @@
-name: Build and Release Antag Video Mod
+name: Build and Release Video Player Mod
 
 on:
   push:
@@ -19,13 +19,12 @@ jobs:
         run: |
           mkdir -p project
           unzip -q antagvideo_clean_source.zip -d project
-          # Move clean_video_mod contents into project root if nested
           if [ -d project/clean_video_mod ]; then
             cp -r project/clean_video_mod/* project/
             rm -rf project/clean_video_mod
           fi
 
-      - name: Apply Fabric 26.2 Toolchain & Code
+      - name: Configure Video Player Mod for Fabric 26.2
         working-directory: project
         run: |
           cat << 'BUILD_GRADLE' > build.gradle
@@ -75,9 +74,9 @@ jobs:
           loader_version=0.19.3
           loom_version=1.17-SNAPSHOT
 
-          mod_version=1.1.0
+          mod_version=1.2.0
           maven_group=com.antagvideo
-          archives_base_name=antagvideo
+          archives_base_name=VideoPlayer
 
           fabric_api_version=0.150.1+26.2
           PROPS
@@ -89,7 +88,7 @@ jobs:
                   gradlePluginPortal()
               }
           }
-          rootProject.name = 'antagvideo'
+          rootProject.name = 'VideoPlayer'
           SETTINGS
 
           cat << 'MOD_JSON' > src/main/resources/fabric.mod.json
@@ -97,8 +96,8 @@ jobs:
             "schemaVersion": 1,
             "id": "antagvideo",
             "version": "${version}",
-            "name": "Antag Video",
-            "description": "Fullscreen video cutscene player for Fabric 26.2. Command: /videoplay <video> <player>",
+            "name": "Video Player",
+            "description": "Fullscreen video cutscene player for Fabric 26.2. Command: /videoplay <video> [player]",
             "authors": [
               "Mhdajt"
             ],
@@ -121,7 +120,6 @@ jobs:
           }
           MOD_JSON
 
-          # Also write sounds.json to map intro sound
           cat << 'SOUNDS_JSON' > src/main/resources/assets/antagvideo/sounds.json
           {
             "intro": {
@@ -136,7 +134,6 @@ jobs:
           }
           SOUNDS_JSON
 
-          # Write 26.2 Java implementation
           mkdir -p src/main/java/com/antagvideo/client
 
           cat << 'PAYLOAD' > src/main/java/com/antagvideo/PlayVideoPayload.java
@@ -173,7 +170,8 @@ jobs:
           import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
           import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
           import net.minecraft.commands.Commands;
-          import net.minecraft.commands.arguments.EntityArgument;
+          import net.minecraft.commands.SharedSuggestionProvider;
+          import net.minecraft.network.chat.Component;
           import net.minecraft.server.level.ServerPlayer;
           import org.slf4j.Logger;
           import org.slf4j.LoggerFactory;
@@ -183,35 +181,86 @@ jobs:
 
           public class AntagVideoMod implements ModInitializer {
               public static final String MOD_ID = "antagvideo";
-              public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+              public static final Logger LOGGER = LoggerFactory.getLogger("VideoPlayer");
+              public static final String[] AVAILABLE_VIDEOS = new String[] { "Intro" };
 
               @Override
               public void onInitialize() {
-                  LOGGER.info("Antag Video mod loaded - use /videoplay <video> <player>");
+                  LOGGER.info("Video Player mod loaded - use /videoplay <video> [player]");
 
                   PayloadTypeRegistry.clientboundPlay().register(PlayVideoPayload.TYPE, PlayVideoPayload.CODEC);
 
                   CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+                      // /videoplay <video> [player]
                       dispatcher.register(Commands.literal("videoplay")
+                          .executes(ctx -> {
+                              ctx.getSource().sendFeedback(() -> Component.literal("§6§l=== Video Player ==="), false);
+                              ctx.getSource().sendFeedback(() -> Component.literal("§eUsage: §f/videoplay <video> [player]"), false);
+                              ctx.getSource().sendFeedback(() -> Component.literal("§7Available videos: §bIntro"), false);
+                              return 1;
+                          })
                           .then(Commands.argument("video", StringArgumentType.word())
-                              .then(Commands.argument("player", EntityArgument.players())
-                                  .executes(ctx -> send(
-                                      EntityArgument.getPlayers(ctx, "player"),
-                                      StringArgumentType.getString(ctx, "video"))))
+                              .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(AVAILABLE_VIDEOS, builder))
                               .executes(ctx -> {
-                                  ServerPlayer self = ctx.getSource().getPlayerOrException();
-                                  return send(List.of(self), StringArgumentType.getString(ctx, "video"));
-                              })));
+                                  String video = StringArgumentType.getString(ctx, "video");
+                                  ServerPlayer self = ctx.getSource().getPlayer();
+                                  if (self != null) {
+                                      return send(List.of(self), video);
+                                  }
+                                  return 0;
+                              })
+                              .then(Commands.argument("player", StringArgumentType.word())
+                                  .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ctx.getSource().getOnlinePlayerNames(), builder))
+                                  .executes(ctx -> {
+                                      String video = StringArgumentType.getString(ctx, "video");
+                                      String targetName = StringArgumentType.getString(ctx, "player");
 
+                                      if ("@a".equalsIgnoreCase(targetName) || "all".equalsIgnoreCase(targetName)) {
+                                          return send(ctx.getSource().getServer().getPlayerList().getPlayers(), video);
+                                      }
+
+                                      ServerPlayer target = ctx.getSource().getServer().getPlayerList().getPlayerByName(targetName);
+                                      if (target != null) {
+                                          return send(List.of(target), video);
+                                      }
+
+                                      for (ServerPlayer p : ctx.getSource().getServer().getPlayerList().getPlayers()) {
+                                          if (p.getGameProfile().getName().equalsIgnoreCase(targetName)) {
+                                              return send(List.of(p), video);
+                                          }
+                                      }
+
+                                      ctx.getSource().sendFailure(Component.literal("Player not found: " + targetName));
+                                      return 0;
+                                  })
+                              )
+                          )
+                      );
+
+                      // /videostop [player]
                       dispatcher.register(Commands.literal("videostop")
                           .executes(ctx -> {
-                              ServerPlayer self = ctx.getSource().getPlayerOrException();
-                              return send(List.of(self), "stop");
+                              ServerPlayer self = ctx.getSource().getPlayer();
+                              if (self != null) {
+                                  return send(List.of(self), "stop");
+                              }
+                              return 0;
                           })
-                          .then(Commands.argument("player", EntityArgument.players())
-                              .executes(ctx -> send(
-                                  EntityArgument.getPlayers(ctx, "player"),
-                                  "stop"))));
+                          .then(Commands.argument("player", StringArgumentType.word())
+                              .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ctx.getSource().getOnlinePlayerNames(), builder))
+                              .executes(ctx -> {
+                                  String targetName = StringArgumentType.getString(ctx, "player");
+                                  if ("@a".equalsIgnoreCase(targetName) || "all".equalsIgnoreCase(targetName)) {
+                                      return send(ctx.getSource().getServer().getPlayerList().getPlayers(), "stop");
+                                  }
+                                  ServerPlayer target = ctx.getSource().getServer().getPlayerList().getPlayerByName(targetName);
+                                  if (target != null) {
+                                      return send(List.of(target), "stop");
+                                  }
+                                  return 0;
+                              })
+                          )
+                      );
                   });
               }
 
@@ -271,7 +320,7 @@ jobs:
                       sound = SimpleSoundInstance.forUI(event, 1.0f);
                       Minecraft.getInstance().getSoundManager().play(sound);
                   } catch (Exception e) {
-                      AntagVideoMod.LOGGER.warn("Audio playback note: {}", e.getMessage());
+                      AntagVideoMod.LOGGER.warn("Audio note: {}", e.getMessage());
                   }
 
                   queue = new ArrayBlockingQueue<>(16);
@@ -279,7 +328,7 @@ jobs:
                   decoderDone = false;
                   startNanos = System.nanoTime();
 
-                  thread = new Thread(() -> decodeLoop(name), "AntagVideo-Decoder");
+                  thread = new Thread(() -> decodeLoop(name), "VideoPlayer-Decoder");
                   thread.setDaemon(true);
                   thread.start();
 
@@ -288,7 +337,7 @@ jobs:
 
               private static void decodeLoop(String name) {
                   try {
-                      // Check for FGV container first if bundled
+                      // Check for FGV container first if present
                       try (InputStream fgvIn = VideoPlayer.class.getResourceAsStream("/assets/antagvideo/" + name + ".fgv")) {
                           if (fgvIn != null) {
                               decodeFgv(fgvIn);
@@ -410,7 +459,7 @@ jobs:
 
           public class VideoPlayerScreen extends Screen {
               public VideoPlayerScreen() {
-                  super(Component.literal("Antag Video"));
+                  super(Component.literal("Video Player"));
               }
 
               @Override
@@ -466,17 +515,41 @@ jobs:
           cat << 'CLIENT_JAVA' > src/main/java/com/antagvideo/client/AntagVideoClient.java
           package com.antagvideo.client;
 
+          import com.antagvideo.AntagVideoMod;
           import com.antagvideo.PlayVideoPayload;
+          import com.mojang.brigadier.arguments.StringArgumentType;
           import net.fabricmc.api.ClientModInitializer;
           import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
           import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
           import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
           import net.minecraft.client.Minecraft;
+          import net.minecraft.commands.SharedSuggestionProvider;
           import net.minecraft.network.chat.Component;
 
           public class AntagVideoClient implements ClientModInitializer {
               private static volatile String pendingName;
+
+              public static void playLocal(String video) {
+                  Minecraft mc = Minecraft.getInstance();
+                  mc.execute(() -> {
+                      if ("stop".equalsIgnoreCase(video)) {
+                          VideoPlayer.stop();
+                          if (mc.screen instanceof VideoPlayerScreen) {
+                              mc.setScreen(null);
+                          }
+                          return;
+                      }
+                      String error = VideoPlayer.start(video);
+                      if (error != null) {
+                          if (mc.player != null) {
+                              mc.player.sendSystemMessage(Component.literal("[Video Player] " + error));
+                          }
+                      } else {
+                          mc.setScreenAndShow(new VideoPlayerScreen());
+                      }
+                  });
+              }
 
               @Override
               public void onInitializeClient() {
@@ -484,7 +557,41 @@ jobs:
                       pendingName = payload.name();
                   });
 
+                  // Client-side command registration for /videoplay <video> [player] and /videostop
                   ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) -> {
+                      dispatcher.register(ClientCommands.literal("videoplay")
+                          .executes(ctx -> {
+                              ctx.getSource().sendFeedback(Component.literal("§6§l=== Video Player ==="));
+                              ctx.getSource().sendFeedback(Component.literal("§eUsage: §f/videoplay <video> [player]"));
+                              ctx.getSource().sendFeedback(Component.literal("§7Available videos: §bIntro"));
+                              return 1;
+                          })
+                          .then(ClientCommands.argument("video", StringArgumentType.word())
+                              .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(AntagVideoMod.AVAILABLE_VIDEOS, builder))
+                              .executes(ctx -> {
+                                  String video = StringArgumentType.getString(ctx, "video");
+                                  playLocal(video);
+                                  return 1;
+                              })
+                              .then(ClientCommands.argument("player", StringArgumentType.word())
+                                  .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ctx.getSource().getOnlinePlayerNames(), builder))
+                                  .executes(ctx -> {
+                                      String video = StringArgumentType.getString(ctx, "video");
+                                      playLocal(video);
+                                      return 1;
+                                  })
+                              )
+                          )
+                      );
+
+                      dispatcher.register(ClientCommands.literal("videostop")
+                          .executes(ctx -> {
+                              playLocal("stop");
+                              ctx.getSource().sendFeedback(Component.literal("§c⏹ Video stopped"));
+                              return 1;
+                          })
+                      );
+
                       dispatcher.register(ClientCommands.literal("antagmode")
                           .then(ClientCommands.literal("stretch").executes(ctx -> {
                               VideoPlayer.mode = "stretch";
@@ -506,25 +613,12 @@ jobs:
                           return;
                       }
                       pendingName = null;
-
-                      if ("stop".equals(name)) {
-                          VideoPlayer.stop();
-                          return;
-                      }
-                      String error = VideoPlayer.start(name);
-                      if (error != null) {
-                          if (mc.player != null) {
-                              mc.player.sendSystemMessage(Component.literal("[Antag Video] " + error));
-                          }
-                      } else {
-                          mc.setScreenAndShow(new VideoPlayerScreen());
-                      }
+                      playLocal(name);
                   });
               }
           }
           CLIENT_JAVA
 
-          # Remove old VideoCommand / VideoRenderer if present
           rm -f src/main/java/com/antagvideo/command/VideoCommand.java
           rm -f src/main/java/com/antagvideo/client/VideoRenderer.java
 
@@ -544,43 +638,38 @@ jobs:
       - name: Upload the mod jar artifact
         uses: actions/upload-artifact@v4
         with:
-          name: antagvideo-1.1.0-jar
+          name: VideoPlayer-1.2.0-jar
           path: project/build/libs/*.jar
 
       - name: Publish Ready-to-Install JAR to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          JAR_FILE=$(ls project/build/libs/antagvideo-[0-9]*.jar | grep -v sources | head -n 1)
+          JAR_FILE=$(ls project/build/libs/VideoPlayer-[0-9]*.jar | grep -v sources | head -n 1)
           echo "Found compiled mod jar: $JAR_FILE"
           
-          gh release delete v1.1.0 --yes || true
-          git tag -d v1.1.0 || true
-          git push origin :refs/tags/v1.1.0 || true
+          gh release delete v1.2.0 --yes || true
+          git tag -d v1.2.0 || true
+          git push origin :refs/tags/v1.2.0 || true
 
           cat << 'NOTES' > /tmp/release_notes.md
-          ### Antag Video Cutscene Player v1.1.0 for Fabric 26.2
+          ### Video Player v1.2.0 for Fabric 26.2
 
-          Ready-to-install Minecraft mod built directly from the clean source!
+          Updated release with dropdown suggestion list and flexible player argument!
 
-          #### Included Features:
-          - Full 43-second video playback with all 402 high-resolution frames
-          - Synchronized audio playback (`intro.ogg`)
-          - Background-threaded decoding for perfectly smooth 60 FPS rendering without lag spikes
-          - Pure black letterboxing maintaining the exact cinematic aspect ratio (`fit` mode)
-          - Skip at any time by pressing **[ESC]**
-          - Optional aspect ratio command: `/antagmode fit|stretch|cover`
+          #### Changes:
+          - **Command**: `/videoplay <video> [player]`
+          - **Command Suggestions**: Typing `/videoplay ` shows a suggestion list of available videos (`Intro`).
+          - **Optional Player Argument**: If no player name is given, plays for the player executing the command.
+          - **Simple String Target**: Target player name is a simple string rather than strict entity selector, preventing command parsing errors.
+          - **Mod Name**: Renamed to **Video Player**.
+          - **All 402 Frames Retained**: Full 43-second cutscene at 854x392 with synchronized audio (`intro.ogg`).
+          - **Skip Controls**: Press **[ESC]** or type `/videostop`.
 
           #### Installation:
           1. Install **Fabric Loader (0.19+)** and **Fabric API** for Minecraft **26.2**.
-          2. Download **`antagvideo-1.1.0.jar`** below and place it into your `.minecraft/mods` folder.
-          3. Launch Minecraft!
-
-          #### In-game Commands:
-          - `/videoplay <video name> <player>` (e.g. `/videoplay Intro Steve` or `/videoplay Intro @s`)
-          - `/videostop [player]`
+          2. Download **`VideoPlayer-1.2.0.jar`** below and drop it into your `.minecraft/mods` folder.
+          3. Run `/videoplay Intro` in-game!
           NOTES
 
-          gh release create v1.1.0 "$JAR_FILE" \
-            --title "Antag Video Mod v1.1.0 (Fabric 26.2)" \
-            --notes-file /tmp/release_notes.md
+          gh release create v1.2.0 "$JAR_FILE"             --title "Video Player v1.2.0 (Fabric 26.2)"             --notes-file /tmp/release_notes.md
