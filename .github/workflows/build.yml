@@ -74,7 +74,7 @@ jobs:
           loader_version=0.19.3
           loom_version=1.17-SNAPSHOT
 
-          mod_version=1.2.0
+          mod_version=1.3.0
           maven_group=com.antagvideo
           archives_base_name=VideoPlayer
 
@@ -123,6 +123,15 @@ jobs:
           cat << 'SOUNDS_JSON' > src/main/resources/assets/antagvideo/sounds.json
           {
             "intro": {
+              "category": "master",
+              "sounds": [
+                {
+                  "name": "antagvideo:intro",
+                  "stream": true
+                }
+              ]
+            },
+            "audio": {
               "category": "master",
               "sounds": [
                 {
@@ -285,6 +294,7 @@ jobs:
           import net.minecraft.resources.Identifier;
           import net.minecraft.sounds.SoundEvent;
 
+          import java.io.ByteArrayInputStream;
           import java.io.InputStream;
           import java.util.concurrent.ArrayBlockingQueue;
           import java.util.concurrent.TimeUnit;
@@ -294,7 +304,7 @@ jobs:
               public static volatile String mode = "fit";
 
               public static final int TOTAL_FRAMES = 402;
-              public static final double FPS = 9.5;
+              public static final double FPS = 402.0 / 42.84;
               public static final double DURATION = 42.84;
 
               private record Frame(int index, NativeImage image) {}
@@ -311,11 +321,92 @@ jobs:
 
               private VideoPlayer() {}
 
+              public static InputStream openFrameStream(int frame) {
+                  String filename = String.format("%04d.jpg", frame);
+                  String relativePath = "assets/antagvideo/textures/frames/" + filename;
+
+                  // 1. Thread Context ClassLoader (NO leading slash)
+                  try {
+                      ClassLoader ccl = Thread.currentThread().getContextClassLoader();
+                      if (ccl != null) {
+                          InputStream is = ccl.getResourceAsStream(relativePath);
+                          if (is != null) return is;
+                      }
+                  } catch (Throwable ignored) {}
+
+                  // 2. Class.getClassLoader() (NO leading slash)
+                  try {
+                      ClassLoader cl = VideoPlayer.class.getClassLoader();
+                      if (cl != null) {
+                          InputStream is = cl.getResourceAsStream(relativePath);
+                          if (is != null) return is;
+                      }
+                  } catch (Throwable ignored) {}
+
+                  // 3. FabricLoader ModContainer.findPath() - works directly inside mod jar on PC and Android (MJLauncher)
+                  try {
+                      var modOpt = net.fabricmc.loader.api.FabricLoader.getInstance().getModContainer(AntagVideoMod.MOD_ID);
+                      if (modOpt.isPresent()) {
+                          var pathOpt = modOpt.get().findPath(relativePath);
+                          if (pathOpt.isPresent()) {
+                              return java.nio.file.Files.newInputStream(pathOpt.get());
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+
+                  // 4. Minecraft ResourceManager
+                  try {
+                      Identifier id = Identifier.fromNamespaceAndPath(AntagVideoMod.MOD_ID, "textures/frames/" + filename);
+                      var res = Minecraft.getInstance().getResourceManager().getResource(id);
+                      if (res.isPresent()) {
+                          return res.get().open();
+                      }
+                  } catch (Throwable ignored) {}
+
+                  // 5. VideoPlayer.class.getResourceAsStream (with leading slash)
+                  try {
+                      InputStream is = VideoPlayer.class.getResourceAsStream("/" + relativePath);
+                      if (is != null) return is;
+                  } catch (Throwable ignored) {}
+
+                  // 6. VideoPlayer.class.getResourceAsStream (without leading slash)
+                  try {
+                      InputStream is = VideoPlayer.class.getResourceAsStream(relativePath);
+                      if (is != null) return is;
+                  } catch (Throwable ignored) {}
+
+                  return null;
+              }
+
               public static synchronized String start(String name) {
                   stop();
 
+                  if (!"intro".equalsIgnoreCase(name)) {
+                      return "Video not found: " + name + ". Available: Intro";
+                  }
+
+                  // Synchronously preload and upload frame 1 so the texture is immediately ready on screen open
+                  try (InputStream is = openFrameStream(1)) {
+                      if (is != null) {
+                          byte[] bytes = is.readAllBytes();
+                          NativeImage img = NativeImage.read(NativeImage.Format.RGBA, new ByteArrayInputStream(bytes));
+                          texW = img.getWidth();
+                          texH = img.getHeight();
+                          texture = new DynamicTexture(() -> "antagvideo video", texW, texH, false);
+                          Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
+                          texture.getPixels().copyFrom(img);
+                          texture.upload();
+                          img.close();
+                      } else {
+                          AntagVideoMod.LOGGER.error("Could not find frame 1 at assets/antagvideo/textures/frames/0001.jpg");
+                      }
+                  } catch (Exception e) {
+                      AntagVideoMod.LOGGER.error("Error preloading frame 1: {}", e.getMessage());
+                  }
+
+                  // Start synchronized audio
                   try {
-                      Identifier soundId = Identifier.fromNamespaceAndPath(AntagVideoMod.MOD_ID, name.toLowerCase());
+                      Identifier soundId = Identifier.fromNamespaceAndPath(AntagVideoMod.MOD_ID, "intro");
                       SoundEvent event = SoundEvent.createVariableRangeEvent(soundId);
                       sound = SimpleSoundInstance.forUI(event, 1.0f);
                       Minecraft.getInstance().getSoundManager().play(sound);
@@ -328,32 +419,48 @@ jobs:
                   decoderDone = false;
                   startNanos = System.nanoTime();
 
-                  thread = new Thread(() -> decodeLoop(name), "VideoPlayer-Decoder");
+                  thread = new Thread(VideoPlayer::decodeLoop, "VideoPlayer-Decoder");
                   thread.setDaemon(true);
                   thread.start();
 
                   return null;
               }
 
-              private static void decodeLoop(String name) {
-                  try {
-                      // Check for FGV container first if present
-                      try (InputStream fgvIn = VideoPlayer.class.getResourceAsStream("/assets/antagvideo/" + name + ".fgv")) {
-                          if (fgvIn != null) {
-                              decodeFgv(fgvIn);
-                              return;
-                          }
-                      } catch (Exception ignored) {}
+              private static long due() {
+                  return (long) ((System.nanoTime() - startNanos) * FPS / 1.0e9) + 1;
+              }
 
-                      // Read sequential JPEG frames from textures/frames/%04d.jpg
+              private static void decodeLoop() {
+                  try {
                       for (int i = 1; i <= TOTAL_FRAMES && running; i++) {
-                          String path = String.format("/assets/antagvideo/textures/frames/%04d.jpg", i);
-                          try (InputStream is = VideoPlayer.class.getResourceAsStream(path)) {
-                              if (is != null) {
-                                  NativeImage img = NativeImage.read(NativeImage.Format.RGBA, is);
-                                  while (running && !queue.offer(new Frame(i, img), 50, TimeUnit.MILLISECONDS)) {
-                                  }
+                          // Pacing: don't decode too far ahead
+                          while (running && i > due() + 4) {
+                              Thread.sleep(10);
+                          }
+                          if (!running) break;
+
+                          // Frame drop: if phone/CPU is falling behind audio, skip ahead to stay in sync
+                          if (i < due() - 1 && i < TOTAL_FRAMES) {
+                              continue;
+                          }
+
+                          try (InputStream is = openFrameStream(i)) {
+                              if (is == null) {
+                                  continue;
                               }
+                              byte[] bytes = is.readAllBytes();
+                              NativeImage img = NativeImage.read(NativeImage.Format.RGBA, new ByteArrayInputStream(bytes));
+                              Frame frame = new Frame(i, img);
+
+                              boolean queued = false;
+                              while (running && !queued) {
+                                  queued = queue.offer(frame, 20, TimeUnit.MILLISECONDS);
+                              }
+                              if (!queued) {
+                                  img.close();
+                              }
+                          } catch (Exception ex) {
+                              AntagVideoMod.LOGGER.error("Failed loading frame {}: {}", i, ex.getMessage());
                           }
                       }
                   } catch (Exception e) {
@@ -363,52 +470,34 @@ jobs:
                   }
               }
 
-              private static void decodeFgv(InputStream in) throws Exception {
-                  java.io.DataInputStream dis = new java.io.DataInputStream(new java.io.BufferedInputStream(in));
-                  byte[] magic = new byte[4];
-                  dis.readFully(magic);
-                  int fgvFps = dis.readInt();
-                  int total = dis.readInt();
-                  for (int i = 0; i < total && running; i++) {
-                      int len = dis.readInt();
-                      byte[] jpeg = new byte[len];
-                      dis.readFully(jpeg);
-                      NativeImage img = NativeImage.read(NativeImage.Format.RGBA, new java.io.ByteArrayInputStream(jpeg));
-                      while (running && !queue.offer(new Frame(i, img), 50, TimeUnit.MILLISECONDS)) {
-                      }
-                  }
-              }
-
               public static void pullFrame() {
-                  if (!running) return;
-                  long elapsedNanos = System.nanoTime() - startNanos;
-                  double elapsedSec = elapsedNanos / 1_000_000_000.0;
-                  int targetFrame = (int) (elapsedSec * FPS) + 1;
-
-                  Frame candidate = null;
-                  while (queue != null && !queue.isEmpty()) {
-                      Frame peek = queue.peek();
-                      if (peek != null && peek.index <= targetFrame) {
-                          if (candidate != null) candidate.image.close();
-                          candidate = queue.poll();
-                      } else {
-                          break;
-                      }
+                  ArrayBlockingQueue<Frame> q = queue;
+                  if (q == null || !running) {
+                      return;
                   }
-
-                  if (candidate != null) {
-                      NativeImage img = candidate.image;
+                  long due = due();
+                  Frame latest = null;
+                  Frame f;
+                  while ((f = q.peek()) != null && f.index() <= due) {
+                      q.poll();
+                      if (latest != null) {
+                          latest.image().close();
+                      }
+                      latest = f;
+                  }
+                  if (latest != null) {
+                      NativeImage image = latest.image();
                       try {
-                          if (texture == null || texW != img.getWidth() || texH != img.getHeight()) {
-                              texW = img.getWidth();
-                              texH = img.getHeight();
+                          if (texture == null || texW != image.getWidth() || texH != image.getHeight()) {
+                              texW = image.getWidth();
+                              texH = image.getHeight();
                               texture = new DynamicTexture(() -> "antagvideo video", texW, texH, false);
                               Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
                           }
-                          texture.getPixels().copyFrom(img);
+                          texture.getPixels().copyFrom(image);
                           texture.upload();
                       } finally {
-                          img.close();
+                          image.close();
                       }
                   }
               }
@@ -420,10 +509,10 @@ jobs:
                       thread = null;
                   }
                   if (queue != null) {
-                      for (Frame f : queue) {
-                          try { f.image.close(); } catch (Exception ignored) {}
+                      Frame f;
+                      while ((f = queue.poll()) != null) {
+                          try { f.image().close(); } catch (Exception ignored) {}
                       }
-                      queue.clear();
                       queue = null;
                   }
                   if (sound != null) {
@@ -440,7 +529,8 @@ jobs:
               }
 
               public static boolean isFinished() {
-                  return decoderDone && (queue == null || queue.isEmpty());
+                  ArrayBlockingQueue<Frame> q = queue;
+                  return running && decoderDone && q != null && q.isEmpty() && due() >= TOTAL_FRAMES;
               }
 
               public static boolean hasTexture() { return texture != null; }
@@ -473,6 +563,15 @@ jobs:
               }
 
               @Override
+              public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+                  if (keyCode == 256) { // GLFW_KEY_ESCAPE
+                      this.onClose();
+                      return true;
+                  }
+                  return super.keyPressed(keyCode, scanCode, modifiers);
+              }
+
+              @Override
               public void removed() {
                   VideoPlayer.stop();
               }
@@ -487,21 +586,21 @@ jobs:
                       int th = VideoPlayer.texHeight();
                       String mode = VideoPlayer.mode;
 
-                      if ("fit".equals(mode)) {
-                          double s = Math.min((double) this.width / tw, (double) this.height / th);
-                          int dw = (int) (tw * s);
-                          int dh = (int) (th * s);
-                          g.blit(RenderPipelines.GUI_TEXTURED, VideoPlayer.TEXTURE,
-                              (this.width - dw) / 2, (this.height - dh) / 2, 0, 0, dw, dh, tw, th, tw, th);
-                      } else if ("cover".equals(mode)) {
+                      if ("cover".equals(mode)) {
                           double s = Math.max((double) this.width / tw, (double) this.height / th);
                           int rw = Math.min(tw, (int) Math.ceil(this.width / s));
                           int rh = Math.min(th, (int) Math.ceil(this.height / s));
                           g.blit(RenderPipelines.GUI_TEXTURED, VideoPlayer.TEXTURE,
                               0, 0, (tw - rw) / 2, (th - rh) / 2, this.width, this.height, rw, rh, tw, th);
-                      } else {
+                      } else if ("stretch".equals(mode)) {
                           g.blit(RenderPipelines.GUI_TEXTURED, VideoPlayer.TEXTURE,
                               0, 0, 0, 0, this.width, this.height, tw, th, tw, th);
+                      } else { // default "fit" - cinematic aspect ratio with black bars
+                          double s = Math.min((double) this.width / tw, (double) this.height / th);
+                          int dw = (int) (tw * s);
+                          int dh = (int) (th * s);
+                          g.blit(RenderPipelines.GUI_TEXTURED, VideoPlayer.TEXTURE,
+                              (this.width - dw) / 2, (this.height - dh) / 2, 0, 0, dw, dh, tw, th, tw, th);
                       }
                   }
 
@@ -528,11 +627,34 @@ jobs:
           import net.minecraft.network.chat.Component;
 
           public class AntagVideoClient implements ClientModInitializer {
-              private static volatile String pendingName;
+              private static volatile String pendingVideo;
 
-              public static void playLocal(String video) {
-                  Minecraft mc = Minecraft.getInstance();
-                  mc.execute(() -> {
+              public static void requestPlay(String video) {
+                  pendingVideo = video;
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  // Handle server-directed playback packets
+                  ClientPlayNetworking.registerGlobalReceiver(PlayVideoPayload.TYPE, (payload, context) -> {
+                      requestPlay(payload.name());
+                  });
+
+                  // Open screen once chat screen is closed
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      String video = pendingVideo;
+                      if (video == null) {
+                          return;
+                      }
+
+                      // If chat screen is open, close it first
+                      if (mc.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen) {
+                          mc.setScreenAndShow(null);
+                          return;
+                      }
+
+                      pendingVideo = null;
+
                       if ("stop".equalsIgnoreCase(video)) {
                           VideoPlayer.stop();
                           if (mc.gui.screen() instanceof VideoPlayerScreen) {
@@ -540,21 +662,15 @@ jobs:
                           }
                           return;
                       }
+
                       String error = VideoPlayer.start(video);
                       if (error != null) {
                           if (mc.player != null) {
-                              mc.player.sendSystemMessage(Component.literal("[Video Player] " + error));
+                              mc.player.sendSystemMessage(Component.literal("§c[Video Player] " + error));
                           }
                       } else {
                           mc.setScreenAndShow(new VideoPlayerScreen());
                       }
-                  });
-              }
-
-              @Override
-              public void onInitializeClient() {
-                  ClientPlayNetworking.registerGlobalReceiver(PlayVideoPayload.TYPE, (payload, context) -> {
-                      pendingName = payload.name();
                   });
 
                   // Client-side command registration for /videoplay <video> [player] and /videostop
@@ -570,14 +686,20 @@ jobs:
                               .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(AntagVideoMod.AVAILABLE_VIDEOS, builder))
                               .executes(ctx -> {
                                   String video = StringArgumentType.getString(ctx, "video");
-                                  playLocal(video);
+                                  requestPlay(video);
                                   return 1;
                               })
                               .then(ClientCommands.argument("player", StringArgumentType.word())
                                   .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ctx.getSource().getOnlinePlayerNames(), builder))
                                   .executes(ctx -> {
                                       String video = StringArgumentType.getString(ctx, "video");
-                                      playLocal(video);
+                                      String player = StringArgumentType.getString(ctx, "player");
+                                      Minecraft mc = Minecraft.getInstance();
+                                      if (mc.player != null && !player.equalsIgnoreCase(mc.player.getName().getString()) && mc.getConnection() != null) {
+                                          mc.getConnection().sendCommand("videoplay " + video + " " + player);
+                                      } else {
+                                          requestPlay(video);
+                                      }
                                       return 1;
                                   })
                               )
@@ -586,34 +708,29 @@ jobs:
 
                       dispatcher.register(ClientCommands.literal("videostop")
                           .executes(ctx -> {
-                              playLocal("stop");
+                              requestPlay("stop");
                               ctx.getSource().sendFeedback(Component.literal("§c⏹ Video stopped"));
                               return 1;
                           })
                       );
 
                       dispatcher.register(ClientCommands.literal("antagmode")
+                          .then(ClientCommands.literal("fit").executes(ctx -> {
+                              VideoPlayer.mode = "fit";
+                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: fit (cinematic black bars)"));
+                              return 1;
+                          }))
                           .then(ClientCommands.literal("stretch").executes(ctx -> {
                               VideoPlayer.mode = "stretch";
+                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: stretch (fullscreen)"));
                               return 1;
                           }))
                           .then(ClientCommands.literal("cover").executes(ctx -> {
                               VideoPlayer.mode = "cover";
+                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: cover (crop to fill)"));
                               return 1;
                           }))
-                          .then(ClientCommands.literal("fit").executes(ctx -> {
-                              VideoPlayer.mode = "fit";
-                              return 1;
-                          })));
-                  });
-
-                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
-                      String name = pendingName;
-                      if (name == null || mc.gui.screen() != null) {
-                          return;
-                      }
-                      pendingName = null;
-                      playLocal(name);
+                      );
                   });
               }
           }
@@ -638,7 +755,7 @@ jobs:
       - name: Upload the mod jar artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoPlayer-1.2.0-jar
+          name: VideoPlayer-1.3.0-jar
           path: project/build/libs/*.jar
 
       - name: Publish Ready-to-Install JAR to GitHub Releases
@@ -648,30 +765,24 @@ jobs:
           JAR_FILE=$(ls project/build/libs/VideoPlayer-[0-9]*.jar | grep -v sources | head -n 1)
           echo "Found compiled mod jar: $JAR_FILE"
           
-          gh release delete v1.2.0 --yes || true
-          git tag -d v1.2.0 || true
-          git push origin :refs/tags/v1.2.0 || true
+          gh release delete v1.3.0 --yes || true
+          git tag -d v1.3.0 || true
+          git push origin :refs/tags/v1.3.0 || true
 
           cat << 'NOTES' > /tmp/release_notes.md
-          ### Video Player v1.2.0 for Fabric 26.2
+          ### Video Player v1.3.0 for Fabric 26.2
 
-          Updated release with dropdown suggestion list and flexible player argument!
+          Fixed frame loading and screen rendering for both PC and Android (MJLauncher)!
 
-          #### Changes:
-          - **Command**: `/videoplay <video> [player]`
-          - **Command Suggestions**: Typing `/videoplay ` shows a suggestion list of available videos (`Intro`).
-          - **Optional Player Argument**: If no player name is given, plays for the player executing the command.
-          - **Simple String Target**: Target player name is a simple string rather than strict entity selector, preventing command parsing errors.
-          - **Mod Name**: Renamed to **Video Player**.
-          - **All 402 Frames Retained**: Full 43-second cutscene at 854x392 with synchronized audio (`intro.ogg`).
-          - **Skip Controls**: Press **[ESC]** or type `/videostop`.
-
-          #### Installation:
-          1. Install **Fabric Loader (0.19+)** and **Fabric API** for Minecraft **26.2**.
-          2. Download **`VideoPlayer-1.2.0.jar`** below and drop it into your `.minecraft/mods` folder.
-          3. Run `/videoplay Intro` in-game!
+          #### What was fixed:
+          1. **Frame Loading**: Added multi-tier resource resolution with `ClassLoader.getResourceAsStream("assets/antagvideo/textures/frames/%04d.jpg")` (no leading slash), FabricLoader `ModContainer.findPath()`, and Minecraft's `ResourceManager`. Works reliably inside mod JARs on both PC and Android (MJLauncher/PojavLauncher).
+          2. **No Black Screen**: Synchronously decodes and uploads frame 1 before screen presentation so the texture is immediately valid on display.
+          3. **DynamicTexture & NativeImage**: Proper RGBA pixel decoding with STB memory buffers and GPU texture upload.
+          4. **Audio & Frame Sync**: Real-time elapsed nanosecond synchronization with adaptive frame pacing and frame dropping to prevent desync on mobile CPUs.
+          5. **Command**: `/videoplay <video> [player]` with dropdown autocompletion for `Intro`, optional simple-string player argument, and tick-synchronized screen opening after chat input.
+          6. **Mod Name**: **Video Player** (Fabric 26.2).
           NOTES
 
-          gh release create v1.2.0 "$JAR_FILE" \
-            --title "Video Player v1.2.0 (Fabric 26.2)" \
+          gh release create v1.3.0 "$JAR_FILE" \
+            --title "Video Player v1.3.0 (Fabric 26.2)" \
             --notes-file /tmp/release_notes.md
