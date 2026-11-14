@@ -194,9 +194,9 @@ jobs:
                       // /videoplay <video> [player]
                       dispatcher.register(Commands.literal("videoplay")
                           .executes(ctx -> {
-                              ctx.getSource().sendFeedback(() -> Component.literal("§6§l=== Video Player ==="), false);
-                              ctx.getSource().sendFeedback(() -> Component.literal("§eUsage: §f/videoplay <video> [player]"), false);
-                              ctx.getSource().sendFeedback(() -> Component.literal("§7Available videos: §bIntro"), false);
+                              ctx.getSource().sendSuccess(() -> Component.literal("§6§l=== Video Player ==="), false);
+                              ctx.getSource().sendSuccess(() -> Component.literal("§eUsage: §f/videoplay <video> [player]"), false);
+                              ctx.getSource().sendSuccess(() -> Component.literal("§7Available videos: §bIntro"), false);
                               return 1;
                           })
                           .then(Commands.argument("video", StringArgumentType.word())
@@ -225,7 +225,7 @@ jobs:
                                       }
 
                                       for (ServerPlayer p : ctx.getSource().getServer().getPlayerList().getPlayers()) {
-                                          if (p.getGameProfile().getName().equalsIgnoreCase(targetName)) {
+                                          if (p.getName().getString().equalsIgnoreCase(targetName)) {
                                               return send(List.of(p), video);
                                           }
                                       }
@@ -535,8 +535,8 @@ jobs:
                   mc.execute(() -> {
                       if ("stop".equalsIgnoreCase(video)) {
                           VideoPlayer.stop();
-                          if (mc.screen instanceof VideoPlayerScreen) {
-                              mc.setScreen(null);
+                          if (mc.gui.screen() instanceof VideoPlayerScreen) {
+                              mc.setScreenAndShow(null);
                           }
                           return;
                       }
@@ -672,4 +672,6 @@ jobs:
           3. Run `/videoplay Intro` in-game!
           NOTES
 
-          gh release create v1.2.0 "$JAR_FILE"             --title "Video Player v1.2.0 (Fabric 26.2)"             --notes-file /tmp/release_notes.md
+          gh release create v1.2.0 "$JAR_FILE" \
+            --title "Video Player v1.2.0 (Fabric 26.2)" \
+            --notes-file /tmp/release_notes.md
