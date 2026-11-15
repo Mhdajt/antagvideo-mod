@@ -692,7 +692,7 @@ jobs:
                           String name = payload.name();
                           if ("stop".equalsIgnoreCase(name)) {
                               VideoPlayer.stop();
-                              if (context.client().screen() instanceof VideoPlayerScreen) context.client().screen().onClose();
+                              if (context.client().screen instanceof VideoPlayerScreen) context.client().setScreenAndShow(null);
                           } else {
                               requestPlay(name);
                           }
@@ -706,7 +706,7 @@ jobs:
                       Minecraft mc = Minecraft.getInstance();
                       if ("stop".equalsIgnoreCase(video)) {
                           VideoPlayer.stop();
-                          if (mc.screen() instanceof VideoPlayerScreen) mc.screen().onClose();
+                          if (mc.screen instanceof VideoPlayerScreen) mc.setScreenAndShow(null);
                           return;
                       }
                       String error = VideoPlayer.start(video);
