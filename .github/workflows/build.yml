@@ -74,7 +74,7 @@ jobs:
           loader_version=0.19.3
           loom_version=1.17-SNAPSHOT
 
-          mod_version=1.4.0
+          mod_version=1.5.0
           maven_group=com.antagvideo
           archives_base_name=VideoPlayer
 
@@ -180,6 +180,7 @@ jobs:
           import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
           import net.minecraft.commands.Commands;
           import net.minecraft.commands.SharedSuggestionProvider;
+          import net.minecraft.commands.arguments.EntityArgument;
           import net.minecraft.network.chat.Component;
           import net.minecraft.server.level.ServerPlayer;
           import org.slf4j.Logger;
@@ -218,31 +219,10 @@ jobs:
                                   }
                                   return 0;
                               })
-                              .then(Commands.argument("player", StringArgumentType.word())
-                                  .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ctx.getSource().getOnlinePlayerNames(), builder))
-                                  .executes(ctx -> {
-                                      String video = StringArgumentType.getString(ctx, "video");
-                                      String targetName = StringArgumentType.getString(ctx, "player");
-
-                                      if ("@a".equalsIgnoreCase(targetName) || "all".equalsIgnoreCase(targetName)) {
-                                          return send(ctx.getSource().getServer().getPlayerList().getPlayers(), video);
-                                      }
-
-                                      ServerPlayer target = ctx.getSource().getServer().getPlayerList().getPlayerByName(targetName);
-                                      if (target != null) {
-                                          return send(List.of(target), video);
-                                      }
-
-                                      for (ServerPlayer p : ctx.getSource().getServer().getPlayerList().getPlayers()) {
-                                          if (p.getName().getString().equalsIgnoreCase(targetName)) {
-                                              return send(List.of(p), video);
-                                          }
-                                      }
-
-                                      ctx.getSource().sendFailure(Component.literal("Player not found: " + targetName));
-                                      return 0;
-                                  })
-                              )
+                              .then(Commands.argument("player", EntityArgument.players())
+                                  .executes(ctx -> send(
+                                      EntityArgument.getPlayers(ctx, "player"),
+                                      StringArgumentType.getString(ctx, "video"))))
                           )
                       );
 
@@ -255,20 +235,10 @@ jobs:
                               }
                               return 0;
                           })
-                          .then(Commands.argument("player", StringArgumentType.word())
-                              .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ctx.getSource().getOnlinePlayerNames(), builder))
-                              .executes(ctx -> {
-                                  String targetName = StringArgumentType.getString(ctx, "player");
-                                  if ("@a".equalsIgnoreCase(targetName) || "all".equalsIgnoreCase(targetName)) {
-                                      return send(ctx.getSource().getServer().getPlayerList().getPlayers(), "stop");
-                                  }
-                                  ServerPlayer target = ctx.getSource().getServer().getPlayerList().getPlayerByName(targetName);
-                                  if (target != null) {
-                                      return send(List.of(target), "stop");
-                                  }
-                                  return 0;
-                              })
-                          )
+                          .then(Commands.argument("player", EntityArgument.players())
+                              .executes(ctx -> send(
+                                  EntityArgument.getPlayers(ctx, "player"),
+                                  "stop")))
                       );
                   });
               }
@@ -403,19 +373,22 @@ jobs:
                       try {
                           NativeImage img = null;
                           try {
-                              img = NativeImage.read(bytes);
+                              img = NativeImage.read(NativeImage.Format.RGBA, new ByteArrayInputStream(bytes));
                           } catch (Throwable t) {
-                              img = NativeImage.read(new ByteArrayInputStream(bytes));
+                              img = NativeImage.read(NativeImage.Format.RGBA, new ByteArrayInputStream(bytes));
                           }
                           if (img != null) {
                               texW = img.getWidth();
                               texH = img.getHeight();
-                              DynamicTexture old = texture;
-                              texture = new DynamicTexture(() -> "antagvideo video", img);
-                              Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
-                              if (old != null) {
-                                  try { old.close(); } catch (Throwable ignored) {}
+                              if (texture != null) {
+                                  Minecraft.getInstance().getTextureManager().release(TEXTURE);
+                                  texture.close();
                               }
+                              texture = new DynamicTexture(() -> "antagvideo video", texW, texH, false);
+                              Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
+                              texture.getPixels().copyFrom(img);
+                              texture.upload();
+                              img.close();
                               statusMessage = "Frame 1 loaded (" + texW + "x" + texH + ")";
                           }
                       } catch (Throwable e) {
@@ -478,10 +451,10 @@ jobs:
 
                           NativeImage img = null;
                           try {
-                              img = NativeImage.read(bytes);
+                              img = NativeImage.read(NativeImage.Format.RGBA, new ByteArrayInputStream(bytes));
                           } catch (Throwable t) {
                               try {
-                                  img = NativeImage.read(new ByteArrayInputStream(bytes));
+                                  img = NativeImage.read(NativeImage.Format.RGBA, new ByteArrayInputStream(bytes));
                               } catch (Throwable t2) {
                                   AntagVideoMod.LOGGER.error("NativeImage decode failed frame {}: {}", i, t2.getMessage());
                               }
@@ -527,14 +500,18 @@ jobs:
                       currentFrameIndex = latest.index();
                       NativeImage image = latest.image();
                       try {
-                          texW = image.getWidth();
-                          texH = image.getHeight();
-                          DynamicTexture old = texture;
-                          texture = new DynamicTexture(() -> "antagvideo video", image);
-                          Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
-                          if (old != null) {
-                              try { old.close(); } catch (Throwable ignored) {}
+                          if (texture == null || texW != image.getWidth() || texH != image.getHeight()) {
+                              if (texture != null) {
+                                  Minecraft.getInstance().getTextureManager().release(TEXTURE);
+                                  texture.close();
+                              }
+                              texW = image.getWidth();
+                              texH = image.getHeight();
+                              texture = new DynamicTexture(() -> "antagvideo video", texW, texH, false);
+                              Minecraft.getInstance().getTextureManager().register(TEXTURE, texture);
                           }
+                          texture.getPixels().copyFrom(image);
+                          texture.upload();
                           statusMessage = "Playing frame " + currentFrameIndex;
                       } catch (Throwable t) {
                           AntagVideoMod.LOGGER.error("DynamicTexture error: {}", t.getMessage());
@@ -612,6 +589,7 @@ jobs:
 
               @Override
               public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
+                  super.extractRenderState(g, mouseX, mouseY, delta);
                   VideoPlayer.pullFrame();
                   g.fill(0, 0, this.width, this.height, 0xFF000000);
 
@@ -640,7 +618,7 @@ jobs:
                       }
                   } else {
                       // Diagnostic info if texture is not ready
-                      g.text(this.font, Component.literal("§c[Video Player] " + VideoPlayer.statusMessage), 20, this.height / 2, 0xFFFF55, true);
+                      g.text(this.font, Component.literal("[Video Player] " + VideoPlayer.statusMessage), 20, this.height / 2, 0xFFFF5555, true);
                       g.text(this.font, Component.literal("§7Frame: " + VideoPlayer.currentFrameIndex + "/" + VideoPlayer.TOTAL_FRAMES), 20, this.height / 2 + 15, 0xAAAAAA, true);
                   }
 
@@ -649,8 +627,6 @@ jobs:
                   int prog = (int) Math.min(this.width, (VideoPlayer.elapsedSeconds() / VideoPlayer.DURATION) * this.width);
                   g.fill(0, this.height - barH, prog, this.height, 0xFF00E676);
                   g.fill(prog, this.height - barH, this.width, this.height, 0x44222222);
-
-                  super.extractRenderState(g, mouseX, mouseY, delta);
 
                   if (VideoPlayer.isFinished()) {
                       this.onClose();
@@ -803,7 +779,7 @@ jobs:
       - name: Upload the mod jar artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoPlayer-1.4.0-jar
+          name: VideoPlayer-1.5.0-jar
           path: project/build/libs/*.jar
 
       - name: Publish Ready-to-Install JAR to GitHub Releases
@@ -813,24 +789,23 @@ jobs:
           JAR_FILE=$(ls project/build/libs/VideoPlayer-[0-9]*.jar | grep -v sources | head -n 1)
           echo "Found compiled mod jar: $JAR_FILE"
           
-          gh release delete v1.4.0 --yes || true
-          git tag -d v1.4.0 || true
-          git push origin :refs/tags/v1.4.0 || true
+          gh release delete v1.5.0 --yes || true
+          git tag -d v1.5.0 || true
+          git push origin :refs/tags/v1.5.0 || true
 
           cat << 'NOTES' > /tmp/release_notes.md
-          ### Video Player v1.4.0 for Fabric 26.2
+          ### Video Player v1.5.0 for Fabric 26.2
 
           Fixed frame loading and screen rendering for both PC and Android (MJLauncher)!
 
           #### What was fixed:
-          1. **Frame Loading**: Added multi-tier resource resolution with `ClassLoader.getResourceAsStream("assets/antagvideo/textures/frames/%04d.jpg")` (no leading slash), FabricLoader `ModContainer.findPath()`, and Minecraft's `ResourceManager`. Works reliably inside mod JARs on both PC and Android (MJLauncher/PojavLauncher).
-          2. **No Black Screen**: Synchronously decodes and uploads frame 1 before screen presentation so the texture is immediately valid on display.
-          3. **DynamicTexture & NativeImage**: Proper RGBA pixel decoding with STB memory buffers and GPU texture upload.
-          4. **Audio & Frame Sync**: Real-time elapsed nanosecond synchronization with adaptive frame pacing and frame dropping to prevent desync on mobile CPUs.
-          5. **Command**: `/videoplay <video> [player]` with dropdown autocompletion for `Intro`, optional simple-string player argument, and tick-synchronized screen opening after chat input.
-          6. **Mod Name**: **Video Player** (Fabric 26.2).
+          1. **Frame texture upload**: Allocate one persistent `DynamicTexture`, copy decoded JPEG pixels into its `NativeImage` backing buffer, and call `upload()`; use the same upload path for the preloaded first frame and every subsequent frame.
+          2. **Render ordering**: Render the base screen state first, then draw the fullscreen video and overlays so superclass rendering cannot cover the image.
+          3. **Selector targets**: Use Minecraft's player-selector argument for `/videoplay <video> [player]`, including `@p`, `@s`, `@a`, `@r`, and explicit player names; omitting the target still plays for the issuer.
+          4. **Audio and timing**: Keep the existing synchronized audio and frame timing, retaining all 402 JPEG frames.
+          5. **Video suggestions and name**: Keep the `Intro` suggestion and the displayed mod name **Video Player**.
           NOTES
 
-          gh release create v1.4.0 "$JAR_FILE" \
-            --title "Video Player v1.4.0 (Fabric 26.2)" \
+          gh release create v1.5.0 "$JAR_FILE" \
+            --title "Video Player v1.5.0 (Fabric 26.2)" \
             --notes-file /tmp/release_notes.md
