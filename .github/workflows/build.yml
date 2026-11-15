@@ -24,6 +24,35 @@ jobs:
             rm -rf project/clean_video_mod
           fi
 
+      - name: Convert video frames to Minecraft-readable PNG
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pil
+          python3 - << 'PY'
+          from PIL import Image
+          from pathlib import Path
+          import io
+
+          frames = Path("project/src/main/resources/assets/antagvideo/textures/frames")
+          previous = None
+          for i in range(1, 403):
+              jpg = frames / f"{i:04d}.jpg"
+              png = frames / f"{i:04d}.png"
+              if jpg.exists() and jpg.stat().st_size:
+                  image = Image.open(jpg).convert("RGB")
+                  previous = image
+              elif previous is not None:
+                  print(f"Repairing empty/missing frame {i:04d} from previous frame")
+                  image = previous.copy()
+              else:
+                  raise RuntimeError(f"Missing first frame: {jpg}")
+              image = image.resize((576, 264), Image.Resampling.BILINEAR)
+              image.save(png, format="PNG", optimize=False, compress_level=1)
+              if jpg.exists():
+                  jpg.unlink()
+          print("Converted 402 frames to 576x264 PNG")
+          PY
+
       - name: Configure Video Player Mod for Fabric 26.2
         working-directory: project
         run: |
@@ -74,7 +103,7 @@ jobs:
           loader_version=0.19.3
           loom_version=1.17-SNAPSHOT
 
-          mod_version=1.5.0
+          mod_version=1.6.0
           maven_group=com.antagvideo
           archives_base_name=VideoPlayer
 
@@ -295,7 +324,7 @@ jobs:
               private VideoPlayer() {}
 
               public static byte[] loadFrameBytes(int frame) {
-                  String filename = String.format("%04d.jpg", frame);
+                  String filename = String.format("%04d.png", frame);
                   String relativePath = "assets/antagvideo/textures/frames/" + filename;
 
                   // 1. Thread Context ClassLoader
@@ -396,8 +425,8 @@ jobs:
                           statusMessage = "Frame 1 decode error: " + e.getMessage();
                       }
                   } else {
-                      AntagVideoMod.LOGGER.error("Could not find frame 1 at assets/antagvideo/textures/frames/0001.jpg");
-                      statusMessage = "Could not locate 0001.jpg in jar";
+                      AntagVideoMod.LOGGER.error("Could not find frame 1 at assets/antagvideo/textures/frames/0001.png");
+                      statusMessage = "Could not locate 0001.png in jar";
                   }
 
                   // Start synchronized audio
@@ -640,14 +669,12 @@ jobs:
 
           import com.antagvideo.AntagVideoMod;
           import com.antagvideo.PlayVideoPayload;
-          import com.mojang.brigadier.arguments.StringArgumentType;
           import net.fabricmc.api.ClientModInitializer;
           import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
           import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
           import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
           import net.minecraft.client.Minecraft;
-          import net.minecraft.commands.SharedSuggestionProvider;
           import net.minecraft.network.chat.Component;
 
           public class AntagVideoClient implements ClientModInitializer {
@@ -659,99 +686,52 @@ jobs:
 
               @Override
               public void onInitializeClient() {
-                  // Handle server-directed playback packets
+                  AntagVideoMod.LOGGER.info("AntagVideoClient initialized");
                   ClientPlayNetworking.registerGlobalReceiver(PlayVideoPayload.TYPE, (payload, context) -> {
-                      requestPlay(payload.name());
+                      context.client().execute(() -> {
+                          String name = payload.name();
+                          if ("stop".equalsIgnoreCase(name)) {
+                              VideoPlayer.stop();
+                              if (context.client().screen instanceof VideoPlayerScreen) context.client().screen.onClose();
+                          } else {
+                              requestPlay(name);
+                          }
+                      });
                   });
 
-                  // Open screen once chat screen is closed
-                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
                       String video = pendingVideo;
-                      if (video == null) {
-                          return;
-                      }
-
-                      // If chat screen is open, close it first
-                      if (mc.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen) {
-                          mc.setScreenAndShow(null);
-                          return;
-                      }
-
+                      if (video == null) return;
                       pendingVideo = null;
-
+                      Minecraft mc = Minecraft.getInstance();
                       if ("stop".equalsIgnoreCase(video)) {
                           VideoPlayer.stop();
-                          if (mc.gui.screen() instanceof VideoPlayerScreen) {
-                              mc.setScreenAndShow(null);
-                          }
+                          if (mc.screen instanceof VideoPlayerScreen) mc.screen.onClose();
                           return;
                       }
-
                       String error = VideoPlayer.start(video);
                       if (error != null) {
-                          if (mc.player != null) {
-                              mc.player.sendSystemMessage(Component.literal("§c[Video Player] " + error));
-                          }
+                          if (mc.player != null) mc.player.sendSystemMessage(Component.literal("§c[Video Player] " + error));
                       } else {
                           mc.setScreenAndShow(new VideoPlayerScreen());
                       }
                   });
 
-                  // Client-side command registration for /videoplay <video> [player] and /videostop
                   ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) -> {
-                      dispatcher.register(ClientCommands.literal("videoplay")
-                          .executes(ctx -> {
-                              ctx.getSource().sendFeedback(Component.literal("§6§l=== Video Player ==="));
-                              ctx.getSource().sendFeedback(Component.literal("§eUsage: §f/videoplay <video> [player]"));
-                              ctx.getSource().sendFeedback(Component.literal("§7Available videos: §bIntro"));
-                              return 1;
-                          })
-                          .then(ClientCommands.argument("video", StringArgumentType.word())
-                              .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(AntagVideoMod.AVAILABLE_VIDEOS, builder))
-                              .executes(ctx -> {
-                                  String video = StringArgumentType.getString(ctx, "video");
-                                  requestPlay(video);
-                                  return 1;
-                              })
-                              .then(ClientCommands.argument("player", StringArgumentType.word())
-                                  .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(ctx.getSource().getOnlinePlayerNames(), builder))
-                                  .executes(ctx -> {
-                                      String video = StringArgumentType.getString(ctx, "video");
-                                      String player = StringArgumentType.getString(ctx, "player");
-                                      Minecraft mc = Minecraft.getInstance();
-                                      if (mc.player != null && !player.equalsIgnoreCase(mc.player.getName().getString()) && mc.getConnection() != null) {
-                                          mc.getConnection().sendCommand("videoplay " + video + " " + player);
-                                      } else {
-                                          requestPlay(video);
-                                      }
-                                      return 1;
-                                  })
-                              )
-                          )
-                      );
-
-                      dispatcher.register(ClientCommands.literal("videostop")
-                          .executes(ctx -> {
-                              requestPlay("stop");
-                              ctx.getSource().sendFeedback(Component.literal("§c⏹ Video stopped"));
-                              return 1;
-                          })
-                      );
-
                       dispatcher.register(ClientCommands.literal("antagmode")
                           .then(ClientCommands.literal("fit").executes(ctx -> {
                               VideoPlayer.mode = "fit";
-                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: fit (cinematic black bars)"));
+                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: fit"));
                               return 1;
                           }))
                           .then(ClientCommands.literal("stretch").executes(ctx -> {
                               VideoPlayer.mode = "stretch";
-                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: stretch (fullscreen)"));
+                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: stretch"));
                               return 1;
                           }))
                           .then(ClientCommands.literal("cover").executes(ctx -> {
                               VideoPlayer.mode = "cover";
-                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: cover (crop to fill)"));
+                              ctx.getSource().sendFeedback(Component.literal("§aVideo display mode: cover"));
                               return 1;
                           }))
                       );
@@ -779,7 +759,7 @@ jobs:
       - name: Upload the mod jar artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoPlayer-1.5.0-jar
+          name: VideoPlayer-1.6.0-jar
           path: project/build/libs/*.jar
 
       - name: Publish Ready-to-Install JAR to GitHub Releases
@@ -789,23 +769,20 @@ jobs:
           JAR_FILE=$(ls project/build/libs/VideoPlayer-[0-9]*.jar | grep -v sources | head -n 1)
           echo "Found compiled mod jar: $JAR_FILE"
           
-          gh release delete v1.5.0 --yes || true
-          git tag -d v1.5.0 || true
-          git push origin :refs/tags/v1.5.0 || true
+          gh release delete v1.6.0 --yes || true
+          git tag -d v1.6.0 || true
+          git push origin :refs/tags/v1.6.0 || true
 
           cat << 'NOTES' > /tmp/release_notes.md
-          ### Video Player v1.5.0 for Fabric 26.2
+          ### Video Player v1.6.0 for Fabric 26.2
 
-          Fixed frame loading and screen rendering for both PC and Android (MJLauncher)!
+          Fixes the black video screen and selector command conflict.
 
-          #### What was fixed:
-          1. **Frame texture upload**: Allocate one persistent `DynamicTexture`, copy decoded JPEG pixels into its `NativeImage` backing buffer, and call `upload()`; use the same upload path for the preloaded first frame and every subsequent frame.
-          2. **Render ordering**: Render the base screen state first, then draw the fullscreen video and overlays so superclass rendering cannot cover the image.
-          3. **Selector targets**: Use Minecraft's player-selector argument for `/videoplay <video> [player]`, including `@p`, `@s`, `@a`, `@r`, and explicit player names; omitting the target still plays for the issuer.
-          4. **Audio and timing**: Keep the existing synchronized audio and frame timing, retaining all 402 JPEG frames.
-          5. **Video suggestions and name**: Keep the `Intro` suggestion and the displayed mod name **Video Player**.
+          - Converts all 402 bundled frames to standard PNG files during the build, repairing the known empty frame 0075 and keeping the complete 42.84-second video.
+          - Removes the competing client-side `/videoplay` command so the server command provides `Intro` autocomplete and Minecraft player selectors such as `@s`, `@p`, `@a`, and `@r`.
+          - Keeps `/videoplay <video> [player]`, audio timing, and the Video Player mod name.
           NOTES
 
-          gh release create v1.5.0 "$JAR_FILE" \
-            --title "Video Player v1.5.0 (Fabric 26.2)" \
+          gh release create v1.6.0 "$JAR_FILE" \
+            --title "Video Player v1.6.0 (Fabric 26.2)" \
             --notes-file /tmp/release_notes.md
